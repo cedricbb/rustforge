@@ -1,37 +1,92 @@
 services:
   ollama:
-    image: ollama/ollama
+    image: ollama/ollama:latest
     container_name: codev-ollama
     ports:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+      - ;:scripts/ollama-init.sh:/ollama-init.sh
     environment:
       - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_MAX_LOADED_MODELS=2
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          memory: 2G
+        limits:
+          memory: 8G
 
   codev-agent:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
     container_name: codev-agent
     depends_on:
       ollama:
         condition: service_healthy
     volumes:
+      # Mount workspace for project files
       - ./workspace:/app/workspace
-      - /var/run/docker.sock:/var/run/docker.sock  # Pour exécution de commandes
+      # Mount source for hot reload in dev
+      - .:/app/src:ro
+      # Docker socket for container operations
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Config and data persistence
+      - ./config:/app/config
+      - codev_data:/app/data
     environment:
       - OLLAMA_ENDPOINT=http://ollama:11434
       - RUST_LOG=debug
+      - RUST_BACKTRACE=1
+      - CODEV_ENV=development
+      - CODEV_WORKSPACE=/app/workspace
+      - CODEV_DATA_DIR=/app/data
     networks:
       - codev-network
+    ports:
+      - "8080:8080" # Future web interface
+    restart: unless-stopped
+    working_dir: /app
+    command: ["cargo", "run", "--bin", "codev-cli", "--", "daemon"]
+
+  # Redis for caching and session storage
+  redis:
+    image: redis:7-alpine
+    container_name: codev-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - codev-network
+    restart: unless-stopped
 
 networks:
   codev-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
 
 volumes:
   ollama_data:
+    driver: local
+  codev_data:
+    driver: local
+  redis_data:
+    driver: local
