@@ -1,0 +1,142 @@
+# Development override for docker-compose.yml
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+version: '3.8'
+
+services:
+  ollama:
+    # Pull latest models on startup
+    command: >
+      sh -c "
+        ollama serve &
+        sleep 10 &&
+        ollama pull codellama:7b &&
+        ollama pull llama2:7b &&
+        wait
+      "
+    # Expose additional debugging port
+    ports:
+      - "11434:11434"
+      - "11435:11435"  # Debug port
+    environment:
+      - OLLAMA_DEBUG=1
+      - OLLAMA_KEEP_ALIVE=1h
+    volumes:
+      - ./scripts/ollama-init.sh:/ollama-init.sh:ro
+
+  codev-agent:
+    # Override build target for development
+    build:
+      target: development
+    # Mount source code for hot reload
+    volumes:
+      - .:/app/src:ro
+      - ./workspace:/app/workspace
+      - ./config:/app/config
+      - codev_data:/app/data
+      - ./logs:/app/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Cargo cache for faster builds
+      - cargo_cache:/usr/local/cargo/registry
+      - target_cache:/app/target
+    environment:
+      - CODEV_ENV=development
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=full
+      - OLLAMA_ENDPOINT=http://ollama:11434
+      - CARGO_INCREMENTAL=1
+      # Enable cargo watch for hot reload
+      - CARGO_WATCH=1
+    # Override command for development
+    command: ["cargo", "watch", "-x", "run --bin codev-cli -- daemon"]
+    # Expose development ports
+    ports:
+      - "8080:8080"   # Main API
+      - "8081:8081"   # Debug/metrics
+      - "9615:9615"   # Prometheus metrics
+    # Enable stdin for interactive debugging
+    stdin_open: true
+    tty: true
+
+  # Development database for testing
+  postgres:
+    image: postgres:15-alpine
+    container_name: codev-postgres-dev
+    environment:
+      - POSTGRES_DB=codev_dev
+      - POSTGRES_USER=codev
+      - POSTGRES_PASSWORD=codev_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - codev-network
+
+  # Development tools
+  adminer:
+    image: adminer:latest
+    container_name: codev-adminer
+    ports:
+      - "8082:8080"
+    networks:
+      - codev-network
+    depends_on:
+      - postgres
+
+  # Prometheus for metrics (development)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: codev-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.dev.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - codev-network
+
+  # Grafana for metrics visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: codev-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=codev_dev
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./config/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - codev-network
+    depends_on:
+      - prometheus
+
+volumes:
+  cargo_cache:
+    driver: local
+  target_cache:
+    driver: local
+  postgres_dev_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+# Development network with custom subnet
+networks:
+  codev-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1

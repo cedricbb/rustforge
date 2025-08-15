@@ -3,7 +3,7 @@ members = [
     "crates/codev-core",
     "crates/codev-cli",
     "crates/codev-shared"
-]
+, "crates/codev-core/Cargo"]
 resolver = "2"
 
 [workspace.package]
