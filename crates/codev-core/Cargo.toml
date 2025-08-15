@@ -1,0 +1,80 @@
+[package]
+name = "codev-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Core engine and AI providers for CoDev.rs"
+
+[dependencies]
+# Shared types
+codev-shared = { path = "../codev-shared" }
+
+# Async runtime
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# http client for LLM communication
+reqwest = { workspace = true }
+hyper = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+toml = { workspace = true }
+
+# Git operation
+git2 = "0.20"
+
+# File system operations
+walkdir = "2.5"
+ignore = "0.4" # for gitignore patterns
+
+# Code parsing (for analysis)
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+quote = "1.0"
+
+# Template engine
+handlebars = "6.3"
+
+# Utilities
+uuid = { workspace = true }
+dirs = { workspace = true }
+mime_guess = "2.0"
+sha2 = "0.10"
+
+# Optional database support
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite"], optional = true }
+
+# Optional Redis support for caching
+redis = { version = "0.32", optional = true }
+
+# Security
+secrecy = "0.10"
+
+[dev-dependencies]
+mockall = { workspace = true }
+tempfile = "3.20"
+tokio-test = "0.4"
+
+[features]
+default = ["database", "cache"]
+database = ["sqlx"]
+cache = ["redis"]
+test-ollama = []
+test-apis = []
+integration-tests = []
