@@ -257,3 +257,251 @@ impl OllamaProvider {
         Err(last_error.unwrap())
     }
 }
+
+#[async_trait]
+impl LlmProvider for OllamaProvider {
+    fn id(&self) -> ProviderId {
+        ProviderId::Ollama
+    }
+
+    fn name(&self) -> &str {
+        "Ollama"
+    }
+
+    fn is_available(&self) -> bool {
+        // This is a synchronous check - we'll do a more thorough check in health_check
+        true
+    }
+
+    #[instrument(skip(self))]
+    async fn health_check(&self) -> Result<(HealthStatus)> {
+        debug!("Performing Ollama health check");
+
+        // Check if service is running
+        if !self.is_service_running().await {
+            return Ok(HealthStatus::Unhealthy {
+                error: format!("Ollama service not accessible at {}", self.endpoint),
+            });
+        }
+
+        // Check if model is available
+        match self.is_model_available().await {
+            Ok(true) => {
+                debug!("Ollama health check passed");
+                Ok(HealthStatus::Healthy)
+            }
+            Ok(false) => {
+                // Try to pull the model
+                match self.pull_model_if_needed().await {
+                    Ok(_) => Ok(HealthStatus::Healthy),
+                    Err(e) => Ok(HealthStatus::Degraded {
+                        reason: format!("Model {} not available and pull failed: {}", self.model, e),
+                    }),
+                }
+            }
+            Err(e) => Ok(HealthStatus::Degraded {
+                reason: format1("Failed to check model availability: {}", e)
+            })
+        }
+    }
+
+    #[instrument(skip(self, prompt, options))]
+    async fn stream_generate(
+        &self,
+        prompt: &str,
+        options: &GenerationOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<String>> + Send>>> {
+        debug!("Starting streaming generation with Ollama");
+
+        let request = OllamaRequest {
+            model: self.model.clone(),
+            prompt: prompt.to_string(),
+            stream: true,
+            options: Some(self.convert_options(options)),
+        };
+
+        let response = self.request_with_retries(|| async {
+            self.client
+                .post(&format!("{}/api/generate", self.endpoint))
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| AiError::NetworkTimeout(self.id()).into())
+        }).await?;
+
+        if !response.status().is_success() {
+            return Err(AiError::ServerError {
+                provider: self.id(),
+                status: response.status().as_u16(),
+                message: "Generate request failed".to_string(),
+            }.into());
+        }
+
+        let stream = response
+            .bytes_stream()
+            .map(|chunk| {
+                chunk
+                    .map_err(|e| AiError::StreamingError(e.to_string()).into())
+                    .and_then(|bytes| {
+                        let text = String::from_utf8_lossy(&bytes);
+
+                        // Parse each line as JSON
+                        for line in text.lines() {
+                            if line.trim().is_empty() {
+                                continue;
+                            }
+
+                            match serde_json::from_str::<OllamaResponse>(line) {
+                                Ok(ollama_response) => {
+                                    if !ollama_response.response.is_empty() {
+                                        return Ok(ollama_response.response);
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("Failed to parse streaming response: {} - Line: {}", e, line);
+                                }
+                            }
+                        }
+
+                        Ok(String::new())
+                    })
+            })
+            .filter(|result| {
+                // Filter out empty strings
+                futures::future::ready(match result {
+                    Ok(text) => !text.is_empty(),
+                    Err(_) => true,
+                })
+            });
+
+        Ok(Box::pin(stream))
+    }
+
+    #[instrument(skip(self, prompt, options))]
+    async fn generate(&self, prompt: &str, options: &GenerationOptions) -> Result<String> {
+        debug!("Starting non-streaming generation with Ollama");
+
+        let request = OllamaRequest {
+            model: self.model.clone(),
+            prompt: prompt.to_string(),
+            stream: false,
+            options: Some(self.convert_options(options)),
+        };
+
+        let start_time = Instant::now();
+
+        let response = self.request_with_retries(|| async {
+            self.client
+                .post(&format!("{}/api/generate", self.endpoint))
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| AiError::NetworkTimeout(self.id()).into())
+        }).await?;
+
+        if !response.status().is_success() {
+            return Err(AiError::ServerError {
+                provider: self.id(),
+                status: response.status().as_u16(),
+                message: "Generate request failed".to_string(),
+            }.into());
+        }
+
+        let ollama_response: OllamaResponse = response
+            .json()
+            .await
+            .map_err(|e| AiError::StreamingError(format!("Failed to parse streaming response: {}", e)))?;
+
+        let duration = start_time.elapsed();
+        debug!("Generation completed in {:?}", duration);
+
+        Ok(ollama_response.response)
+    }
+
+    fn max_context_length(&self) -> usize {
+        // Default Ollama context length - this could be made configurable
+        match self.model.as_str() {
+            m if m.contains("codellama") => 16384,
+            m if m.contains("llama2") => 4096,
+            m if m.contains("deepseek") => 8192,
+            _ => 4096,
+        }
+    }
+
+    fn cost_per_token(&self) -> f64 {
+        // Ollama is free for local usage
+        0.0
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            chat: true,
+            code_generation: self.model.contains("code") || self.model.contains("deepseek"),
+            code_analysis: true,
+            function_calling: false, // Ollama doesn't support function calling yet
+            max_content_length: self.max_context_length(),
+            supported_languages: vec![
+                "rust".to_string(),
+                "python".to_string(),
+                "javascript".to_string(),
+                "typescript".to_string(),
+                "go".to_string(),
+                "java".to_string(),
+                "cpp".to_string(),
+                "c".to_string(),
+            ]
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_test;
+
+    #[tokio::test]
+    async fn test_ollama_provider_creation() {
+        let provider = OllamaProvider::new(
+            "http://localhost:11434".to_string(),
+            "codellama:7b".to_string(),
+        );
+
+        assert_eq!(provider.id(), ProviderId::Ollama);
+        assert_eq!(provider.name(), "Ollama");
+        assert_eq!(provider.cost_per_token(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_service_not_running() {
+        let provider = OllamaProvider::new(
+            "http://localhost:99999".to_string(), // Invalid port
+            "codellama:7b".to_string(),
+        );
+
+        let health = provider.health_check().await.unwrap();
+        assert!(matches!(health, HealthStatus::Unhealthy { .. }));
+    }
+
+    #[test]
+    fn test_convert_options() {
+        let provider = OllamaProvider::new(
+            "http://localhost:11434".to_string(),
+            "codellama:7b".to_string(),
+        );
+
+        let options = GenerationOptions {
+            max_tokens: Some(1000),
+            temperature: Some(0.7),
+            top_p: Some (0.9),
+            stop: Some(vec!["```"].to_string()),
+            ..Default::default()
+        };
+
+        let ollama_options = provider.convert_options(&options);
+        assert_eq!(ollama_options.num_predict, Some(1000));
+        assert_eq!(ollama_options.temperature, Some(0.7));
+        assert_eq!(ollama_options.top_p, Some(0.9));
+        assert_eq!(ollama_options.stop, Some(vec!["```"].to_string()));
+    }
+}
